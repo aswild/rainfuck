@@ -1,5 +1,11 @@
+//! rainfuck: A simple Rust brainfuck interpreter.
+
 use std::collections::HashMap;
-use std::io::{stdout, Write};
+use std::fs::File;
+use std::io::{self, BufReader, Read, Write};
+
+use anyhow::{anyhow, Context, Result};
+use clap::{App, Arg, ArgGroup};
 
 #[derive(Copy, Clone, Eq, PartialEq)]
 enum Cmd {
@@ -38,7 +44,7 @@ struct Program {
 }
 
 impl Program {
-    pub fn parse(code: &[u8]) -> Result<Self, &'static str> {
+    pub fn parse(code: &[u8]) -> Result<Self> {
         let mut prog = Program {
             cmds: Vec::new(),
             data: vec![0; 1024],
@@ -58,14 +64,20 @@ impl Program {
                         prog.loops.insert(start, i);
                         prog.loops.insert(i, start);
                     }
-                    None => return Err("unmatched ]"),
+                    None => return Err(anyhow!("unmatched ]")),
                 };
             }
         }
         if !startstack.is_empty() {
-            return Err("unmatched [");
+            return Err(anyhow!("unmatched ["));
         }
         Ok(prog)
+    }
+
+    pub fn load<R: Read>(mut file: R) -> Result<Self> {
+        let mut data = Vec::new();
+        file.read_to_end(&mut data)?;
+        Self::parse(&data)
     }
 
     #[inline(always)]
@@ -78,9 +90,17 @@ impl Program {
         self.data[self.ptr] = val;
     }
 
-    pub fn step(&mut self) -> bool {
+    /// Execute the instruction at self.pc.
+    /// Returns Ok(true) if the program continues, or Ok(false) if the program has halted,
+    /// Returns Err if there's an IO error, only for '.' or ',' commands.
+    /// cin and cout are read/write streams for IO.
+    pub fn step<R: Read, W: Write>(
+        &mut self,
+        cin: &mut R,
+        cout: &mut W,
+    ) -> Result<bool, io::Error> {
         if self.pc >= self.cmds.len() {
-            return false;
+            return Ok(false);
         }
         match self.cmds[self.pc] {
             Cmd::Right => {
@@ -91,7 +111,7 @@ impl Program {
             }
             Cmd::Left => {
                 if self.ptr == 0 {
-                    return false;
+                    return Ok(false);
                 }
                 self.ptr -= 1;
             }
@@ -102,10 +122,15 @@ impl Program {
                 self.set_cell(self.cell().wrapping_sub(1));
             }
             Cmd::Out => {
-                stdout().write(&[self.cell()]).unwrap();
+                cout.write_all(&[self.cell()])?;
             }
             Cmd::In => {
-                todo!();
+                let mut b = [0u8];
+                match cin.read_exact(&mut b) {
+                    Ok(_) => self.set_cell(b[0]),
+                    Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => (),
+                    Err(err) => return Err(err),
+                }
             }
             Cmd::Start => {
                 if self.data[self.ptr] == 0 {
@@ -119,13 +144,64 @@ impl Program {
             }
         }
         self.pc += 1;
-        true
+        Ok(true)
+    }
+
+    /// Run the program to completion, exiting early with Err if an IO error is encountered
+    pub fn run_stdio(&mut self) -> Result<(), io::Error> {
+        let mut cin = io::stdin();
+        let mut cout = io::stdout();
+        loop {
+            match self.step(&mut cin, &mut cout) {
+                Ok(true) => (),
+                Ok(false) => break Ok(()),
+                Err(e) => break Err(e),
+            }
+        }
     }
 }
 
-fn main() {
-    let text = std::env::args().nth(1).unwrap();
-    let mut prog = Program::parse(text.as_bytes()).unwrap();
+fn run() -> Result<()> {
+    let args = App::new("rainfuck")
+        .about("A brainfuck interpreter. Input and output is connected to stdin/stdout")
+        .usage("rainfuck [OPTIONS] {-e PROGRAM | FILE}")
+        .arg(
+            Arg::with_name("code")
+                .short("e")
+                .takes_value(true)
+                .value_name("PROGRAM")
+                .help("Provide the program on the command line rather than as an input file"),
+        )
+        .arg(
+            Arg::with_name("file")
+                .required(false)
+                .value_name("FILE")
+                .help("Source file to run. Required unless -e is used."),
+        )
+        .group(
+            ArgGroup::with_name("input")
+                .arg("code")
+                .arg("file")
+                .required(true),
+        )
+        .get_matches();
 
-    while prog.step() {}
+    let mut prog = if args.is_present("code") {
+        Program::parse(args.value_of("code").unwrap().as_bytes())
+    } else {
+        Program::load(BufReader::new(
+            File::open(args.value_of("file").unwrap()).context("error opening input file")?,
+        ))
+    }
+    .context("failed to parse program")?;
+
+    prog.run_stdio().context("IO Error")?;
+    Ok(())
+}
+
+fn main() {
+    if let Err(e) = run() {
+        eprintln!("{:#}", e);
+        std::process::exit(1);
+    }
 }
